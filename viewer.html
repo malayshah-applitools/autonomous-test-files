@@ -11,7 +11,8 @@
   - On load it tries to open the PDF with no password. A protected PDF shows
     "This PDF is password protected"; an unprotected one shows "This PDF is not password protected"
     and is not rendered, so a test that expects protection fails.
-  - A wrong password shows "Incorrect password".
+  - A wrong password shows "Incorrect password" and bumps "Failed attempts: N" (shown next to the
+    button until the PDF opens), so each rejection can be checked on its own, not on a stale message.
   - The right password renders one page at a time ("Page N of M", "Previous page" / "Next page"),
     with the page's text under it so text checks can read it. #page holds only the rendered page.
 -->
@@ -44,6 +45,7 @@
     <label for="password">Password</label>
     <input id="password" name="password" type="password" autocomplete="off">
     <button type="submit" id="open">Open PDF</button>
+    <span id="attempts" style="color:var(--muted)">Failed attempts: 0</span>
   </form>
   <p class="error" id="error" role="alert" hidden></p>
 
@@ -65,7 +67,7 @@
   const $ = (id) => document.getElementById(id);
   const file = new URLSearchParams(location.search).get('file');
   const WIDTH = 1000; // CSS pixels: every page renders at the same width, so checkpoints are stable
-  let doc = null, current = 1, rendering = false;
+  let doc = null, current = 1, rendering = false, failed = 0;
 
   const isPasswordError = (e, code) => e && e.name === 'PasswordException' && (code === undefined || e.code === code);
 
@@ -142,6 +144,7 @@
       $('viewer').hidden = false;
       await show(1);
     } catch (e) {
+      if (isPasswordError(e)) $('attempts').textContent = `Failed attempts: ${++failed}`;
       $('error').textContent = isPasswordError(e) ? 'Incorrect password' : 'Could not open the PDF: ' + (e && e.message ? e.message : e);
       $('error').hidden = false;
     } finally {
