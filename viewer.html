@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Protected PDF viewer</title>
+<!--
+  Test harness for Applitools Autonomous: opens a password-protected PDF the way an app's
+  in-browser viewer would. Usage: viewer.html?file=<pdf path relative to this page>
+  - On load it tries to open the PDF with no password. A protected PDF shows
+    "This PDF is password protected"; an unprotected one shows "This PDF is not password protected"
+    and is not rendered, so a test that expects protection fails.
+  - A wrong password shows "Incorrect password".
+  - The right password renders one page at a time ("Page N of M", "Previous page" / "Next page"),
+    with the page's text under it so text checks can read it. #page holds only the rendered page.
+-->
+<style>
+  :root { color-scheme: light; --fg: #1f2328; --muted: #59636e; --line: #d1d9e0; --bg: #f6f8fa; --err: #b42318; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--fg); background: #fff; }
+  main { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .status { margin: 0 0 16px; font-weight: 600; }
+  form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+  label { font-weight: 600; }
+  input { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; min-width: 240px; }
+  button { font: inherit; padding: 6px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .error { color: var(--err); font-weight: 600; margin: 8px 0; }
+  .nav { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+  #page { display: inline-block; border: 1px solid var(--line); line-height: 0; max-width: 100%; }
+  #page canvas { max-width: 100%; height: auto; }
+  #page-text { margin-top: 16px; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); white-space: pre-wrap; font-size: 13px; color: var(--muted); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Protected PDF viewer</h1>
+  <p class="status" id="status">Loading…</p>
+
+  <form id="unlock" hidden>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="off">
+    <button type="submit" id="open">Open PDF</button>
+  </form>
+  <p class="error" id="error" role="alert" hidden></p>
+
+  <section id="viewer" hidden>
+    <div class="nav">
+      <button type="button" id="prev">Previous page</button>
+      <span id="page-status" aria-live="polite"></span>
+      <button type="button" id="next">Next page</button>
+    </div>
+    <div id="page"><canvas id="canvas"></canvas></div>
+    <h2 style="font-size:15px;margin:16px 0 0">Text on this page</h2>
+    <div id="page-text"></div>
+  </section>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  const $ = (id) => document.getElementById(id);
+  const file = new URLSearchParams(location.search).get('file');
+  const WIDTH = 1000; // CSS pixels: every page renders at the same width, so checkpoints are stable
+  let doc = null, current = 1, rendering = false;
+
+  const isPasswordError = (e, code) => e && e.name === 'PasswordException' && (code === undefined || e.code === code);
+
+  async function load(password) {
+    return pdfjsLib.getDocument(password === undefined ? { url: file } : { url: file, password }).promise;
+  }
+
+  // PDF.js gives text as positioned runs (spaces are often runs of their own, line ends are not
+  // always flagged), so lay them out by position: a new line when the baseline moves, a space
+  // when there is a horizontal gap, nothing when runs touch.
+  function pageText(items) {
+    let out = '', prev = null;
+    for (const it of items) {
+      if (!it.str) { if (it.hasEOL) out += '\n'; continue; }
+      const x = it.transform[4], y = it.transform[5], size = Math.hypot(it.transform[2], it.transform[3]) || 10;
+      if (prev) {
+        if (prev.hasEOL || Math.abs(y - prev.y) > size * 0.5) out += '\n';
+        else if (x - prev.end > size * 0.15) out += ' ';
+      }
+      out += it.str;
+      prev = { y, end: x + it.width, hasEOL: it.hasEOL };
+    }
+    return out.split('\n').map((l) => l.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
+  }
+
+  async function show(n) {
+    rendering = true;
+    $('prev').disabled = $('next').disabled = true;
+    const page = await doc.getPage(n);
+    const base = page.getViewport({ scale: 1 });
+    const viewport = page.getViewport({ scale: WIDTH / base.width });
+    const ratio = window.devicePixelRatio || 1;
+    const canvas = $('canvas');
+    canvas.width = Math.floor(viewport.width * ratio);
+    canvas.height = Math.floor(viewport.height * ratio);
+    canvas.style.width = Math.floor(viewport.width) + 'px';
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    const text = await page.getTextContent();
+    $('page-text').textContent = pageText(text.items);
+    current = n;
+    // Set last, so "Page N of M" appears only once page N is fully drawn.
+    $('page-status').textContent = `Page ${n} of ${doc.numPages}`;
+    $('prev').disabled = n <= 1;
+    $('next').disabled = n >= doc.numPages;
+    rendering = false;
+  }
+
+  async function init() {
+    if (!file) { $('status').textContent = 'No PDF given: add ?file=<pdf> to the URL'; return; }
+    try {
+      doc = await load();
+      $('status').textContent = 'This PDF is not password protected';
+    } catch (e) {
+      if (isPasswordError(e, pdfjsLib.PasswordResponses.NEED_PASSWORD)) {
+        $('status').textContent = 'This PDF is password protected';
+        $('unlock').hidden = false;
+        $('password').focus();
+      } else {
+        $('status').textContent = 'Could not load the PDF: ' + (e && e.message ? e.message : e);
+      }
+    }
+  }
+
+  $('unlock').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    $('error').hidden = true;
+    $('open').disabled = true;
+    try {
+      doc = await load($('password').value);
+      $('unlock').hidden = true;
+      $('status').textContent = 'PDF unlocked';
+      $('viewer').hidden = false;
+      await show(1);
+    } catch (e) {
+      $('error').textContent = isPasswordError(e) ? 'Incorrect password' : 'Could not open the PDF: ' + (e && e.message ? e.message : e);
+      $('error').hidden = false;
+    } finally {
+      $('open').disabled = false;
+    }
+  });
+  $('prev').addEventListener('click', () => { if (!rendering && current > 1) show(current - 1); });
+  $('next').addEventListener('click', () => { if (!rendering && doc && current < doc.numPages) show(current + 1); });
+
+  init();
+</script>
+</body>
+</html>
